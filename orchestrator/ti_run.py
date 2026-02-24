@@ -85,15 +85,32 @@ def run_weekly(root: Path) -> None:
     print("  - data/derived/trends_7d.json")
     print("  - data/derived/trends_30d.json")
     
+    # Snapshot current state for historical tracking
+    snap_dir = snapshot_state(root)
+    print(f"  - snapshot: {snap_dir.relative_to(root)}")
+    
+    # Compute deltas if we have at least 2 snapshots to compare against
+    delta = None
+    snaps = list_snapshots(root)
+    if len(snaps) >= 2:
+        prev = snaps[-2]
+        cur = snaps[-1]
+        prev_7d = json.loads((prev / "trends_7d.json").read_text(encoding="utf-8"))
+        cur_7d = json.loads((cur / "trends_7d.json").read_text(encoding="utf-8"))
+        delta = compute_deltas(prev_7d, cur_7d)
+        print("[OK] Computed week-over-week deltas.")
+    else:
+        print("[INFO] Not enough history for week-over-week deltas yet.")
+
     ## 4) Generate weekly brief
-    brief_path = generate_weekly_markdown(root)
+    brief_path = generate_weekly_markdown(root, delta=delta)
     print(f"  - {brief_path.relative_to(root)}")
 
     ## Optional: export to Obsidian vault if env var set
     export_to_obsidian(root, brief_path)
     export_to_astro_blog(root, brief_path)
 
-def generate_weekly_markdown(root: Path) -> Path:
+def generate_weekly_markdown(root: Path, delta: dict | None = None) -> Path:
     derived_dir = root / "data" / "derived"
     briefs_dir = root / "data" / "briefs"
     briefs_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +145,18 @@ def generate_weekly_markdown(root: Path) -> Path:
     lines.append(f"- {sev_count('high')} High")
     lines.append(f"- {trends_30['kev_items']} KEV-listed vulnerabilities in last 30 days")
     lines.append("")
+
+    if delta:
+        lines.append("## Week-over-Week Movement")
+        t = delta["total"]
+        pct = f"{t['pct']:.1f}%" if t["pct"] is not None else "n/a"
+        lines.append(f"- Total CVEs: {t['delta']} (from {t['old']} to {t['new']}, {pct})")
+
+        for sev in ["critical", "high", "medium", "low", "unknown"]:
+            d = delta[sev]
+            pct2 = f"{d['pct']:.1f}%" if d["pct"] is not None else "n/a"
+            lines.append(f"- {sev.title()}: {d['delta']} (from {d['old']} to {d['new']}, {pct2})")
+        lines.append("")
 
     lines.append("## Defender Takeaways")
 
@@ -177,6 +206,106 @@ def generate_weekly_markdown(root: Path) -> Path:
     out_path.write_text("\n".join(lines), encoding="utf-8")
     
     return out_path
+
+# Helper to get current UTC date as string
+def utc_date_str() -> str:
+    return str(datetime.now(timezone.utc).date())
+
+# Snapshot management
+def snapshot_state(root: Path) -> Path:
+    """
+    Create a dated snapshot folder containing the key derived artifacts.
+    Returns the snapshot directory path.
+
+    Structure:
+      data/history/YYYY-MM-DD/
+        trends_7d.json
+        trends_30d.json
+        priority_items.json
+        meta.json
+    """
+    today = utc_date_str()
+    hist_root = root / "data" / "history"
+    snap_dir = hist_root / today
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    derived = root / "data" / "derived"
+    required = ["trends_7d.json", "trends_30d.json", "priority_items.json"]
+    for name in required:
+        src = derived / name
+        if not src.exists():
+            raise FileNotFoundError(f"Missing derived artifact for snapshot: {src}")
+        shutil.copyfile(src, snap_dir / name)
+
+    meta = {
+        "snapshot_date": today,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "paths": {name: str((snap_dir / name).relative_to(root)) for name in required},
+    }
+    (snap_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return snap_dir
+
+
+def list_snapshots(root: Path) -> list[Path]:
+    hist_root = root / "data" / "history"
+    if not hist_root.exists():
+        return []
+    snaps = [p for p in hist_root.iterdir() if p.is_dir()]
+    snaps.sort(key=lambda p: p.name)
+    return snaps
+
+# Compute percentage change with safe handling of division by zero
+def pct_change(new: int, old: int) -> float | None:
+    if old == 0:
+        return None
+    return ((new - old) / old) * 100.0
+
+# Compute deltas between two trend summaries
+def compute_deltas(prev_7d: dict, cur_7d: dict) -> dict:
+    """
+    Compare two 7d trend summaries and return delta metrics.
+    """
+    def sev(d: dict, key: str) -> int:
+        return int(d.get("by_severity", {}).get(key, 0))
+
+    old_total = int(prev_7d.get("total_items", 0))
+    new_total = int(cur_7d.get("total_items", 0))
+
+    out = {
+        "total": {
+            "old": old_total,
+            "new": new_total,
+            "delta": new_total - old_total,
+            "pct": pct_change(new_total, old_total),
+        },
+        "critical": {
+            "old": sev(prev_7d, "critical"),
+            "new": sev(cur_7d, "critical"),
+        },
+        "high": {
+            "old": sev(prev_7d, "high"),
+            "new": sev(cur_7d, "high"),
+        },
+        "medium": {
+            "old": sev(prev_7d, "medium"),
+            "new": sev(cur_7d, "medium"),
+        },
+        "low": {
+            "old": sev(prev_7d, "low"),
+            "new": sev(cur_7d, "low"),
+        },
+        "unknown": {
+            "old": sev(prev_7d, "unknown"),
+            "new": sev(cur_7d, "unknown"),
+        },
+    }
+
+    # Add pct per severity
+    for k in ["critical", "high", "medium", "low", "unknown"]:
+        out[k]["delta"] = out[k]["new"] - out[k]["old"]
+        out[k]["pct"] = pct_change(out[k]["new"], out[k]["old"])
+
+    return out
 
 # Optional: export to Obsidian vault if env var set
 def export_to_obsidian(root: Path, brief_path: Path) -> None:
