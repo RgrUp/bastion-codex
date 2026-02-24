@@ -12,6 +12,9 @@ data/
 *.json
 *.json.gz
 
+# --- Logs ---
+logs/
+
 # --- OS / Editor ---
 .DS_Store
 .vscode/
