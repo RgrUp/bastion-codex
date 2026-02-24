@@ -101,7 +101,7 @@ def run_weekly(root: Path) -> None:
         print("[OK] Computed week-over-week deltas.")
     else:
         print("[INFO] Not enough history for week-over-week deltas yet.")
-
+        
     ## 4) Generate weekly brief
     brief_path = generate_weekly_markdown(root, delta=delta)
     print(f"  - {brief_path.relative_to(root)}")
@@ -157,7 +157,11 @@ def generate_weekly_markdown(root: Path, delta: dict | None = None) -> Path:
             pct2 = f"{d['pct']:.1f}%" if d["pct"] is not None else "n/a"
             lines.append(f"- {sev.title()}: {d['delta']} (from {d['old']} to {d['new']}, {pct2})")
         lines.append("")
-
+    else:
+        lines.append("## Week-over-Week Movement")
+        lines.append("- Delta tracking is warming up. This section will populate after at least two weekly snapshots exist.")
+        lines.append("")
+        
     lines.append("## Defender Takeaways")
 
     if sev_count("critical") > 50:
@@ -209,25 +213,19 @@ def generate_weekly_markdown(root: Path, delta: dict | None = None) -> Path:
 
 # Helper to get current UTC date as string
 def utc_date_str() -> str:
-    return str(datetime.now(timezone.utc).date())
+    # filesystem safe: 2026-02-24
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-# Snapshot management
+def utc_stamp() -> str:
+    # filesystem safe: 2026-02-24T21-05-00Z
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+
 def snapshot_state(root: Path) -> Path:
-    """
-    Create a dated snapshot folder containing the key derived artifacts.
-    Returns the snapshot directory path.
+    day = utc_date_str()
+    stamp = utc_stamp()
 
-    Structure:
-      data/history/YYYY-MM-DD/
-        trends_7d.json
-        trends_30d.json
-        priority_items.json
-        meta.json
-    """
-    today = utc_date_str()
-    hist_root = root / "data" / "history"
-    snap_dir = hist_root / today
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    hist_root = root / "data" / "history" / day / stamp
+    hist_root.mkdir(parents=True, exist_ok=True)
 
     derived = root / "data" / "derived"
     required = ["trends_7d.json", "trends_30d.json", "priority_items.json"]
@@ -235,23 +233,32 @@ def snapshot_state(root: Path) -> Path:
         src = derived / name
         if not src.exists():
             raise FileNotFoundError(f"Missing derived artifact for snapshot: {src}")
-        shutil.copyfile(src, snap_dir / name)
+        shutil.copyfile(src, hist_root / name)
 
     meta = {
-        "snapshot_date": today,
+        "snapshot_day": day,
+        "snapshot_stamp": stamp,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "paths": {name: str((snap_dir / name).relative_to(root)) for name in required},
+        "paths": {name: str((hist_root / name).relative_to(root)) for name in required},
     }
-    (snap_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return snap_dir
+    (hist_root / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return hist_root
 
 
 def list_snapshots(root: Path) -> list[Path]:
     hist_root = root / "data" / "history"
     if not hist_root.exists():
         return []
-    snaps = [p for p in hist_root.iterdir() if p.is_dir()]
-    snaps.sort(key=lambda p: p.name)
+
+    snaps: list[Path] = []
+    for day_dir in hist_root.iterdir():
+        if not day_dir.is_dir():
+            continue
+        for stamp_dir in day_dir.iterdir():
+            if stamp_dir.is_dir():
+                snaps.append(stamp_dir)
+
+    snaps.sort(key=lambda p: p.as_posix())
     return snaps
 
 # Compute percentage change with safe handling of division by zero

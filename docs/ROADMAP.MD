@@ -2,7 +2,7 @@
 
 ## Phase 0 – Architecture (Current)
 
-- Finalize system design
+- Finalize system design 
 - Define canonical schema
 - Define folder structure
 - Define V1 scope
