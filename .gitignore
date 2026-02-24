@@ -1,0 +1,17 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- Rust ---
+core/target/
+**/target/
+
+# --- Data (never commit feeds/outputs) ---
+data/
+*.json
+*.json.gz
+
+# --- OS / Editor ---
+.DS_Store
+.vscode/
