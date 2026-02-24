@@ -25,6 +25,18 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+        /// Derive priority items and trend summaries from canonical items.json
+    Derive {
+        /// Input canonical items.json
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        /// Output directory (writes priority_items.json and trends_*.json)
+        #[arg(long, value_name = "DIR")]
+        outdir: PathBuf,
+        /// CVSS threshold for priority inclusion (default: 8.0)
+        #[arg(long, default_value_t = 8.0)]
+        cvss_threshold: f64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -191,6 +203,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Normalize { kev, nvd, out } => normalize_cmd(kev, nvd, out),
+                Commands::Derive { input, outdir, cvss_threshold } => derive_cmd(input, outdir, cvss_threshold),
     }
 }
 
@@ -331,5 +344,138 @@ fn normalize_cmd(kev_path: PathBuf, nvd_path: PathBuf, out_path: PathBuf) -> Res
         now.to_rfc3339(),
     );
 
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct TrendSummary {
+    window: String,               // "7d" or "30d"
+    generated_at: String,         // ISO
+    total_items: usize,
+    kev_items: usize,
+    by_severity: HashMap<String, usize>,
+    top_vendors: Vec<(String, usize)>,
+    top_products: Vec<(String, usize)>,
+}
+
+fn parse_iso_datetime(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+
+    // 1) RFC3339 with timezone (preferred)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // 2) Naive ISO8601 without timezone -> assume UTC
+    // Try with fractional seconds first, then without.
+    use chrono::NaiveDateTime;
+
+    let fmts = [
+        "%Y-%m-%dT%H:%M:%S%.f", // supports .123, .123456, etc.
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+
+    for fmt in fmts {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+        }
+    }
+
+    None
+}
+
+fn pick_item_time(item: &CanonicalItem) -> Option<DateTime<Utc>> {
+    if let Some(p) = &item.published {
+        if let Some(dt) = parse_iso_datetime(p) {
+            return Some(dt);
+        }
+    }
+    if let Some(m) = &item.last_modified {
+        if let Some(dt) = parse_iso_datetime(m) {
+            return Some(dt);
+        }
+    }
+    None
+}
+
+fn top_n_counts(map: &HashMap<String, usize>, n: usize) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = map.iter().map(|(k, c)| (k.clone(), *c)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
+}
+
+fn derive_cmd(input_path: PathBuf, outdir: PathBuf, cvss_threshold: f64) -> Result<()> {
+    let bytes = fs::read(&input_path)
+        .with_context(|| format!("Failed to read input: {}", input_path.display()))?;
+    let items: Vec<CanonicalItem> = serde_json::from_slice(&bytes)
+        .with_context(|| "Failed to parse canonical items.json")?;
+
+    fs::create_dir_all(&outdir)
+        .with_context(|| format!("Failed to create outdir: {}", outdir.display()))?;
+
+    // Priority filter
+    let priority: Vec<CanonicalItem> = items
+        .iter()
+        .cloned()
+        .filter(|i| i.kev || i.cvss.unwrap_or(0.0) >= cvss_threshold)
+        .collect();
+
+    let priority_path = outdir.join("priority_items.json");
+    fs::write(&priority_path, serde_json::to_string_pretty(&priority)?)?;
+
+    // Trend windows
+    let now = Utc::now();
+    let windows = [("7d", 7_i64), ("30d", 30_i64)];
+
+    for (label, days) in windows {
+        let cutoff = now - chrono::Duration::days(days);
+
+        let mut total = 0usize;
+        let mut kev_count = 0usize;
+        let mut by_sev: HashMap<String, usize> = HashMap::new();
+        let mut vendor_counts: HashMap<String, usize> = HashMap::new();
+        let mut product_counts: HashMap<String, usize> = HashMap::new();
+
+        for item in &items {
+            let Some(t) = pick_item_time(item) else { continue; };
+            if t < cutoff { continue; }
+
+            total += 1;
+            if item.kev { kev_count += 1; }
+
+            *by_sev.entry(item.severity_bucket.clone()).or_insert(0) += 1;
+
+            if let Some(v) = &item.vendor {
+                if !v.trim().is_empty() {
+                    *vendor_counts.entry(v.trim().to_string()).or_insert(0) += 1;
+                }
+            }
+            if let Some(p) = &item.product {
+                if !p.trim().is_empty() {
+                    *product_counts.entry(p.trim().to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let summary = TrendSummary {
+            window: label.to_string(),
+            generated_at: now.to_rfc3339(),
+            total_items: total,
+            kev_items: kev_count,
+            by_severity: by_sev,
+            top_vendors: top_n_counts(&vendor_counts, 10),
+            top_products: top_n_counts(&product_counts, 10),
+        };
+
+        let out_path = outdir.join(format!("trends_{}.json", label));
+        fs::write(out_path, serde_json::to_string_pretty(&summary)?)?;
+    }
+
+    eprintln!(
+        "[OK] derive wrote {} priority items and trend summaries to {}",
+        priority.len(),
+        outdir.display()
+    );
     Ok(())
 }
